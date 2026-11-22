@@ -53,9 +53,9 @@ use cua_driver_testkit::sentinel::{run_with_background_oracles, ForegroundSentin
 use cua_driver_testkit::{ax, harness_app, spawn_in_job, Driver, McpDriver, ToolResponse};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsIconic, SetCursorPos, SetWindowPos,
-    ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_MINIMIZE,
-    WS_EX_TOPMOST,
+    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect,
+    IsIconic, SetCursorPos, SetWindowPos, ShowWindow, GUITHREADINFO, GWL_EXSTYLE, HWND_TOPMOST,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_MINIMIZE, WS_EX_TOPMOST,
 };
 
 #[path = "support/foreground_text_oracle.rs"]
@@ -1488,6 +1488,106 @@ fn harness_wpf_scroll() {
                 delivered_with_fixture_state(passed)
             })
             .expect("required WPF session did not start")
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_wpf_foreground_scroll_activates_and_restores() {
+    run_foreground_case(
+        "scroll",
+        Targeting::Ax,
+        DriverRoute::WindowsSendInput,
+        vec![OracleKind::Focus, OracleKind::Cursor],
+        |pid, wid, driver| {
+            let cover_pid = launch_harness(driver).expect("overlapping WPF window");
+            let (cover_wid, _) = driver
+                .find_window(cover_pid as i64, "CuaTestHarness WPF")
+                .expect("overlapping WPF window ID");
+            let window_rect = |id| unsafe {
+                let mut rect = RECT::default();
+                GetWindowRect(HWND(id as *mut _), &mut rect).expect("WPF window rect");
+                rect
+            };
+            assert_eq!(
+                window_rect(wid),
+                window_rect(cover_wid),
+                "fixture windows must overlap"
+            );
+            let before = snapshot(driver, pid, wid);
+            // Both WPF windows start centered at the same size. Use a visible
+            // child of the outer ScrollViewer on small CI desktops.
+            let token = element_token_by_id(&before, "border-click-target");
+            let viewport_marker_y = |state: &ToolResponse| {
+                let token = element_token_by_id(state, "btn-increment");
+                state.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|element| element["element_token"].as_str() == Some(token.as_str()))
+                    .and_then(|element| element["frame"]["y"].as_f64())
+                    .expect("viewport marker's screen position")
+            };
+            focus_harness(driver, cover_pid, cover_wid);
+            let desktop_state = || unsafe {
+                let mut gui = GUITHREADINFO {
+                    cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                    ..Default::default()
+                };
+                let mut cursor = POINT::default();
+                GetGUIThreadInfo(0, &mut gui).expect("keyboard focus");
+                GetCursorPos(&mut cursor).expect("cursor position");
+                (GetForegroundWindow(), gui.hwndFocus, cursor)
+            };
+            let (original_window, original_focus, original_cursor) = desktop_state();
+            assert_eq!(original_window.0 as u64, cover_wid);
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            let activated = std::thread::spawn(move || loop {
+                if unsafe { GetForegroundWindow().0 as u64 } == wid {
+                    return true;
+                }
+                if stopped.recv_timeout(Duration::from_millis(5))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    return false;
+                }
+            });
+            let response = driver.call(
+                "scroll",
+                serde_json::json!({
+                    "pid": pid, "window_id": wid, "element_token": token,
+                    "direction": "down", "amount": 2, "delivery_mode": "foreground"
+                }),
+            );
+            let (returned_window, returned_focus, returned_cursor) = desktop_state();
+            drop(stop);
+            assert!(
+                !response.is_error(),
+                "foreground scroll failed: {}",
+                response.text()
+            );
+            assert!(
+                activated.join().unwrap(),
+                "scroll target never took foreground"
+            );
+            assert_eq!(
+                returned_window, original_window,
+                "foreground window was not restored"
+            );
+            assert_eq!(
+                returned_focus, original_focus,
+                "keyboard focus was not restored"
+            );
+            assert_eq!(
+                returned_cursor, original_cursor,
+                "pointer position was not restored"
+            );
+            assert!(
+                viewport_marker_y(&snapshot(driver, pid, wid)) < viewport_marker_y(&before),
+                "the target viewport did not scroll"
+            );
+            vec![OracleKind::Focus, OracleKind::Cursor]
         },
     );
 }

@@ -20,6 +20,14 @@ pub struct ScrollTool {
 }
 static SCROLL_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+fn foreground_wheel_error(message: String) -> ToolResult {
+    if message.starts_with("foreground_unavailable:") {
+        ToolResult::error(message).with_structured(json!({ "code": "foreground_unavailable" }))
+    } else {
+        ToolResult::error(message)
+    }
+}
+
 #[async_trait]
 impl Tool for ScrollTool {
     fn def(&self) -> &ToolDef {
@@ -35,10 +43,12 @@ impl Tool for ScrollTool {
                 approaches reach backgrounded windows.\n\n\
                 Mapping: `by: \"page\"` → SB_PAGEDOWN/UP/LEFT/RIGHT × amount; \
                 `by: \"line\"` → SB_LINEDOWN/UP/LEFT/RIGHT × amount.\n\n\
-                With `element_token`, the element or its nearest scrollable ancestor scrolls \
-                through UIA ScrollPattern, in the background. Chromium windows (Chrome, Edge, \
+                In background mode, `element_token` selects the element or its nearest scrollable \
+                ancestor through UIA ScrollPattern. Chromium windows (Chrome, Edge, \
                 Electron) drop WM_VSCROLL, so a background scroll there always goes through \
-                UIA: the indexed element's container, or else the window's web Document.".into(),
+                UIA: the indexed element's container, or else the window's web Document.\n\n\
+                Explicit foreground scrolling activates the target, sends a wheel at the \
+                supplied point or indexed element, and checks restoration before returning.".into(),
             input_schema: json!({
                 "type":"object","required":["direction"],"properties":{
                     "session": cua_driver_core::tool_schema::session_schema(),
@@ -168,21 +178,13 @@ impl Tool for ScrollTool {
         // falls through to the message path.
         let chromium_background =
             delivery.is_background() && crate::input::is_chromium_target_window(hwnd);
-        if elem_idx.is_some() || chromium_background {
-            let prev_fg_addr = if delivery.is_background() {
-                Some(unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize
-                })
-            } else {
-                None
+        if delivery.is_background() && (elem_idx.is_some() || chromium_background) {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetAncestor, GetForegroundWindow, GA_ROOT,
             };
-            let _noact = if delivery.is_background() {
-                Some(crate::input::NoActivateGuard::arm(
-                    windows::Win32::Foundation::HWND(hwnd as *mut _),
-                ))
-            } else {
-                None
-            };
+            let prev_fg_addr = unsafe { GetForegroundWindow().0 as isize };
+            let _noact = crate::input::NoActivateGuard::arm(HWND(hwnd as *mut _));
             let direction_for_uia = direction.clone();
             let page = by == "page";
             let uia_result = tokio::task::spawn_blocking({
@@ -214,30 +216,22 @@ impl Tool for ScrollTool {
             })
             .await;
             if matches!(uia_result, Ok(Ok(()))) {
-                if delivery.is_background() {
-                    // Keep WS_EX_NOACTIVATE armed through any WebView handler
-                    // queued by the UIA operation.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    if let Some(previous_addr) = prev_fg_addr {
-                        use windows::Win32::Foundation::HWND;
-                        use windows::Win32::UI::WindowsAndMessaging::{
-                            GetAncestor, GetForegroundWindow, GA_ROOT,
-                        };
-                        let previous = HWND(previous_addr as *mut _);
-                        let current = unsafe { GetForegroundWindow() };
-                        let current_root = unsafe { GetAncestor(current, GA_ROOT) };
-                        let target_root = unsafe { GetAncestor(HWND(hwnd as *mut _), GA_ROOT) };
-                        if !previous.0.is_null()
-                            && current != previous
-                            && !target_root.0.is_null()
-                            && current_root == target_root
-                        {
-                            unsafe {
-                                crate::input::force_foreground_attached(previous);
-                                std::thread::sleep(std::time::Duration::from_millis(12));
-                                crate::input::force_foreground_attached(previous);
-                            }
-                        }
+                // Keep WS_EX_NOACTIVATE armed through any WebView handler
+                // queued by the UIA operation.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let previous = HWND(prev_fg_addr as *mut _);
+                let current = unsafe { GetForegroundWindow() };
+                let current_root = unsafe { GetAncestor(current, GA_ROOT) };
+                let target_root = unsafe { GetAncestor(HWND(hwnd as *mut _), GA_ROOT) };
+                if !previous.0.is_null()
+                    && current != previous
+                    && !target_root.0.is_null()
+                    && current_root == target_root
+                {
+                    unsafe {
+                        crate::input::force_foreground_attached(previous);
+                        std::thread::sleep(std::time::Duration::from_millis(12));
+                        crate::input::force_foreground_attached(previous);
                     }
                 }
                 return ToolResult::text(format!(
@@ -281,12 +275,9 @@ impl Tool for ScrollTool {
                 EventKind::MouseScroll,
             );
         }
-        // delivery_mode:"foreground" — SendInput MOUSEEVENTF_WHEEL at the target
-        // window's screen center (send_wheel_synthesized). The wheel routes to
-        // the window under the cursor — queue-origin input Chromium/GTK accept —
-        // so it lands where PostMessage WM_*SCROLL is dropped. Mirrors the
-        // desktop-scope wheel branch above; `by` (line/page) folds into the tick
-        // count (page ≈ 3 detents).
+        // Window-scoped foreground scroll activates the exact target before
+        // injecting a wheel at the selected point. For `by: "page"`, approximate
+        // a page as three detents.
         if delivery == DeliveryMode::Foreground {
             let (horizontal, sign) = match direction.as_str() {
                 "up" => (false, 1),
@@ -303,7 +294,7 @@ impl Tool for ScrollTool {
             let ticks = sign * (amount as i32) * per;
             // A supplied PX target is window-local in the get_window_state
             // bitmap. Route the wheel there so nested web scrollers receive it;
-            // otherwise retain the whole-window center fallback.
+            // otherwise use the element or whole-window center.
             let px = args.get("x").and_then(|value| value.as_f64());
             let py = args.get("y").and_then(|value| value.as_f64());
             if px.is_some() != py.is_some() {
@@ -322,6 +313,8 @@ impl Tool for ScrollTool {
                     Err(refusal) => return refusal,
                 };
                 Some(bitmap_to_screen(hwnd, x, y))
+            } else if let Some(element) = admitted.as_ref() {
+                Some(element.center)
             } else {
                 tokio::task::spawn_blocking({
                     let admitted = admitted.clone();
@@ -353,17 +346,31 @@ impl Tool for ScrollTool {
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
-                    crate::input::send_wheel_synthesized(cx, cy, ticks, horizontal)
+                    crate::input::mouse::send_window_wheel_synthesized(
+                        pid,
+                        hwnd,
+                        (cx, cy),
+                        ticks,
+                        horizontal,
+                    )
                 }
             })
             .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "✅ Scrolled {dir_disp} via SendInput wheel ({tick_disp} tick(s)) at \
-                     screen ({cx},{cy}) (delivery_mode:foreground)."
-                )),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+                Ok(Ok(outcome)) => match outcome.action {
+                    Ok(()) => ToolResult::text(format!(
+                        "Sent {dir_disp} via SendInput wheel ({tick_disp} tick(s)) at \
+                             screen ({cx},{cy}) (delivery_mode:foreground). \
+                             Foreground restored: {}. Pointer restored: {}.",
+                        outcome.foreground_restored, outcome.pointer_restored
+                    )),
+                    Err(error) => foreground_wheel_error(format!(
+                        "{error}. Foreground restored: {}. Pointer restored: {}.",
+                        outcome.foreground_restored, outcome.pointer_restored
+                    )),
+                },
+                Ok(Err(error)) => foreground_wheel_error(error.to_string()),
+                Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
         }
 

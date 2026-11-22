@@ -23,12 +23,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, GetAncestor, GetClassLongPtrW, GetCursorPos, GetForegroundWindow,
-    GetSystemMetrics, GetWindowLongPtrW, PostMessageW, SetCursorPos, SetWindowPos, WindowFromPoint,
-    CS_DBLCLKS, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GCL_STYLE,
-    GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WS_EX_TOPMOST,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId, PostMessageW, SetCursorPos,
+    SetWindowPos, WindowFromPoint, CS_DBLCLKS, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE,
+    CWP_SKIPTRANSPARENT, GA_ROOT, GCL_STYLE, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WS_EX_TOPMOST,
 };
 
 const MK_LBUTTON: u32 = 0x0001;
@@ -794,7 +795,7 @@ fn send_click_synthesized_mods_impl(
             // Restore our injected movement, but leave a later user/app move alone.
             let mut current_cursor = POINT::default();
             if GetCursorPos(&mut current_cursor).is_ok()
-                && cursor_still_at_injected_click(current_cursor.x, current_cursor.y, sx, sy)
+                && cursor_still_at_injected_point(current_cursor.x, current_cursor.y, sx, sy)
             {
                 let _ = SetCursorPos(prev_cursor.x, prev_cursor.y);
             }
@@ -826,8 +827,8 @@ fn send_click_synthesized_mods_impl(
     Ok(())
 }
 
-fn cursor_still_at_injected_click(x: i32, y: i32, click_x: i32, click_y: i32) -> bool {
-    x.abs_diff(click_x) <= 2 && y.abs_diff(click_y) <= 2
+fn cursor_still_at_injected_point(x: i32, y: i32, injected_x: i32, injected_y: i32) -> bool {
+    x.abs_diff(injected_x) <= 2 && y.abs_diff(injected_y) <= 2
 }
 
 /// Press-hold-move-release drag via `SendInput`, used by the `drag` tool's
@@ -1209,26 +1210,7 @@ fn wheel_mouse_data(ticks: i32) -> u32 {
 /// delivery follows the cursor, so positioning the cursor is sufficient. The
 /// cursor is restored to its previous position afterward.
 pub fn send_wheel_synthesized(sx: i32, sy: i32, ticks: i32, horizontal: bool) -> Result<()> {
-    let flag = if horizontal {
-        MOUSEEVENTF_HWHEEL
-    } else {
-        MOUSEEVENTF_WHEEL
-    };
-    let mouse_data = wheel_mouse_data(ticks);
-
-    let wheel_input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: mouse_data,
-                dwFlags: flag,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
+    let wheel_input = wheel_input(ticks, horizontal);
 
     unsafe {
         let mut prev_cursor = POINT::default();
@@ -1250,6 +1232,163 @@ pub fn send_wheel_synthesized(sx: i32, sy: i32, ticks: i32, horizontal: bool) ->
     }
 
     Ok(())
+}
+
+fn wheel_input(ticks: i32, horizontal: bool) -> INPUT {
+    let flag = if horizontal {
+        MOUSEEVENTF_HWHEEL
+    } else {
+        MOUSEEVENTF_WHEEL
+    };
+    let mouse_data = wheel_mouse_data(ticks);
+
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: mouse_data,
+                dwFlags: flag,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+pub(crate) struct WindowWheelResult {
+    pub action: Result<()>,
+    pub foreground_restored: bool,
+    pub pointer_restored: bool,
+}
+
+/// Send a wheel to a window-scoped foreground target and finish cleanup before
+/// returning. The desktop wheel deliberately has no window activation policy.
+pub(crate) fn send_window_wheel_synthesized(
+    pid: u32,
+    hwnd: u64,
+    point: (i32, i32),
+    ticks: i32,
+    horizontal: bool,
+) -> Result<WindowWheelResult> {
+    let (x, y) = point;
+    let target = HWND(hwnd as *mut _);
+    unsafe {
+        let mut owner = 0;
+        if GetWindowThreadProcessId(target, Some(&mut owner)) == 0 || owner != pid {
+            bail!("foreground_unavailable: the requested scroll window is not owned by pid {pid}; no wheel input was sent");
+        }
+        let Some(target_identity) = crate::win32::capture_foreground_target(hwnd) else {
+            bail!("foreground_unavailable: the requested scroll window no longer exists; no wheel input was sent");
+        };
+        let previous = GetForegroundWindow();
+        let previous_thread = GetWindowThreadProcessId(previous, None);
+        if previous_thread == 0 {
+            bail!("foreground_unavailable: no previous foreground window can be restored; no wheel input was sent");
+        }
+        let mut previous_cursor = POINT::default();
+        GetCursorPos(&mut previous_cursor)
+            .map_err(|err| anyhow!("could not read the original scroll cursor position: {err}"))?;
+
+        let mut moved_cursor = false;
+        let action = (|| -> Result<()> {
+            if !crate::input::force_foreground_assisted(target).0 {
+                bail!("foreground_unavailable: Windows did not activate the scroll target; no wheel input was sent");
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_millis(150);
+            loop {
+                if GetForegroundWindow() != target {
+                    bail!("foreground_unavailable: the scroll target lost foreground; no wheel input was sent");
+                }
+                if crate::input::inject::target_visible_at_point(target, x, y) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    bail!("foreground_unavailable: screen point ({x},{y}) is covered or outside the scroll target; no wheel input was sent");
+                }
+                sleep(Duration::from_millis(15));
+            }
+
+            SetCursorPos(x, y)
+                .map_err(|err| anyhow!("could not move the cursor to the scroll point: {err}"))?;
+            moved_cursor = true;
+            // Let focus and hover handlers process the pointer move before routing a wheel.
+            sleep(Duration::from_millis(30));
+            let mut current = POINT::default();
+            GetCursorPos(&mut current)
+                .map_err(|err| anyhow!("could not verify the scroll cursor position: {err}"))?;
+            if GetForegroundWindow() != target
+                || !crate::input::inject::target_visible_at_point(target, current.x, current.y)
+                || !cursor_still_at_injected_point(current.x, current.y, x, y)
+            {
+                bail!("foreground_unavailable: the scroll target or pointer changed before input; no wheel input was sent");
+            }
+
+            let (dx, dy) = crate::virtualdesk::to_virtualdesk_absolute(
+                x,
+                y,
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            );
+            let move_input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx,
+                        dy,
+                        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                        ..Default::default()
+                    },
+                },
+            };
+            let events = [move_input, wheel_input(ticks, horizontal)];
+            let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+            if sent as usize != events.len() {
+                bail!(
+                    "SendInput inserted {sent}/{} events; no wheel input was sent",
+                    events.len()
+                );
+            }
+
+            // Give the recipient time to dequeue the wheel before moving the pointer back.
+            sleep(Duration::from_millis(75));
+            Ok(())
+        })();
+
+        let mut current = POINT::default();
+        let pointer_restored = if GetCursorPos(&mut current).is_err() {
+            false
+        } else if current == previous_cursor {
+            true
+        } else {
+            moved_cursor
+                && cursor_still_at_injected_point(current.x, current.y, x, y)
+                && SetCursorPos(previous_cursor.x, previous_cursor.y).is_ok()
+                && GetCursorPos(&mut current).is_ok()
+                && current == previous_cursor
+        };
+
+        // Only take the foreground back from this action's target, never from
+        // a different window the user selected while the wheel was in flight.
+        let current = GetForegroundWindow();
+        let previous_still_exists = GetWindowThreadProcessId(previous, None) == previous_thread;
+        let foreground_restored = previous_still_exists
+            && (current == previous
+                || (crate::win32::foreground_matches_target_or_owned_window(
+                    target_identity,
+                    current.0 as u64,
+                ) && crate::input::force_foreground_attached(previous)));
+
+        Ok(WindowWheelResult {
+            action,
+            foreground_restored,
+            pointer_restored,
+        })
+    }
 }
 
 /// Return the current foreground window for desktop-scope keyboard and drag
@@ -1351,15 +1490,15 @@ mod nc_hit_tests {
 
 #[cfg(test)]
 mod cursor_restore_tests {
-    use super::cursor_still_at_injected_click;
+    use super::cursor_still_at_injected_point;
 
     #[test]
     fn restore_only_while_the_cursor_remains_at_the_injected_point() {
-        assert!(cursor_still_at_injected_click(-100, 200, -100, 200));
-        assert!(cursor_still_at_injected_click(-98, 198, -100, 200));
-        assert!(!cursor_still_at_injected_click(-97, 200, -100, 200));
-        assert!(!cursor_still_at_injected_click(-100, 203, -100, 200));
-        assert!(!cursor_still_at_injected_click(i32::MIN, 0, i32::MAX, 0));
+        assert!(cursor_still_at_injected_point(-100, 200, -100, 200));
+        assert!(cursor_still_at_injected_point(-98, 198, -100, 200));
+        assert!(!cursor_still_at_injected_point(-97, 200, -100, 200));
+        assert!(!cursor_still_at_injected_point(-100, 203, -100, 200));
+        assert!(!cursor_still_at_injected_point(i32::MIN, 0, i32::MAX, 0));
     }
 }
 
